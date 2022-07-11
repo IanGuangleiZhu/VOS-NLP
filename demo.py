@@ -118,6 +118,7 @@ emsize = 64
 print(f'Vocab size is {vocab_size}')
 print(f'Embedding size is {emsize}')
 print(f'Num of class is {num_class}')
+print('------------------------------')
 model = TextClassificationModel(vocab_size, emsize, num_class).to(device)
 # consturct variables for GMM
 # shape (num_class, feature_dim=out_channels)
@@ -128,6 +129,15 @@ class_cov = class_cov.repeat(4, 1, 1).to(device)
 class_count = torch.from_numpy(np.zeros(4)).to(device)
 feature_batch = None
 
+
+def is_pos_def(x):
+    return np.all(np.linalg.eigvals(x) > 0)
+
+def is_pos_semi_def(x):
+    return np.all(np.linalg.eigvals(x) >= 0)
+
+def is_symmetric(x):
+    return (x == x.transpose(0, 1)).all()
 
 def update_bayesian(means, covs):
     precs = torch.linalg.inv(covs)
@@ -166,10 +176,18 @@ def update_cov(class_mean, class_cov, class_count, feature_batch, label_batch):
     # label_batch of shape (batch_size)
     for i in range(feature_batch.shape[0]):
         label = label_batch[i]
-        class_cov[label] *= class_count[label] / (1 + class_count[label])
-        class_cov[label] += class_count[label] / (1 + class_count[label]) ** 2 \
-            * (feature_batch[i] - class_mean[label]).reshape((-1, 1)) @ (feature_batch[i] - class_mean[label]).reshape((1, -1))
-
+        if not is_symmetric(class_cov[label]):
+            print('not symmetric before update')
+        x = feature_batch[i]
+        u = class_mean[label]
+        t = class_count[label]
+        delta = (x - u).reshape((1, -1))
+        class_cov[label] *= t / (1 + t)
+        # class_cov[label] += t / ((1 + t) ** 2) \
+            #  * (feature_batch[i] - class_mean[label]).reshape((-1, 1)) @ (feature_batch[i] - class_mean[label]).reshape((1, -1))
+        class_cov[label] += t / ((1 + t) ** 2) * delta.T @ delta
+        if not is_symmetric(delta.T @ delta):
+            print('not symmetric after update')
 
 def train(dataloader, class_count, class_mean, class_cov, feature_batch, sample=True):
     model.train()
@@ -214,6 +232,8 @@ def train(dataloader, class_count, class_mean, class_cov, feature_batch, sample=
         # if (cov < 0).sum() > 0:
             # print('??')
         # print(mean.shape, cov.shape)
+        print(f'is positive semi definite {is_pos_semi_def(class_cov[0].detach().cpu().numpy())}')
+        print(f'is positive definite {is_pos_def(class_cov[0].detach().cpu().numpy())}')
         update_mean(class_mean, class_count, feature_batch, label_batch)
         update_cov(class_mean, class_cov, class_count,
                    feature_batch, label_batch)
@@ -229,22 +249,24 @@ def train(dataloader, class_count, class_mean, class_cov, feature_batch, sample=
 
         # only start sampling after some epoches
         if sample:
-            print('chech if the cov matrix is symetric')
-            print((class_cov[0] == class_cov[0].transpose(0, 1)).all())
+            print('chech if the cov matrix is symmetric')
+            print(f'symetric: {is_symmetric(class_cov[0])}')
             # print(class_mean[0].shape, class_cov[0].shape)
-            m = MultivariateNormal(class_mean[0], class_cov[0] + 0.01 * torch.eye(32, device=device))
+            # m = MultivariateNormal(class_mean[0], class_cov[0] + 0.01 * torch.eye(32, device=device))
+            print(f'is positive definite {is_pos_def(class_cov[0].detach().cpu().numpy())}')
+            m = MultivariateNormal(class_mean[0], class_cov[0])
             # m = MultivariateNormal(mean, cov)
             # m = MultivariateNormal(torch.zeros(32), torch.eye(32))
             # normally distributed with mean=`[0,0]` and covariance_matrix=`I`
-            r = m.sample_n(1000)
+            r = m.sample((1000,))
             p = m.log_prob(r)
             # the feature space outlier
             outlier = torch.amin(p, 0)
             # compute the uncertainty loss
-            uncertainty_loss = -1 * torch.log(torch.sigmoid(mlp(model.energy(outlier))))
+            # uncertainty_loss = -1 * torch.log(torch.sigmoid(mlp(model.energy(outlier))))
             # to-do: not sure how many iid features are needed
-            uncertainty_loss += -1 * torch.log(torch.sigmoid(mlp(model.energy(feature[0]))))
-            uncertainty_loss.backward()
+            # uncertainty_loss += -1 * torch.log(torch.sigmoid(mlp(model.energy(feature[0]))))
+            # uncertainty_loss.backward()
 
 
 def evaluate(dataloader):
