@@ -60,7 +60,7 @@ def collate_batch(batch):
 
 class TextClassificationModel(nn.Module):
 
-    def __init__(self, vocab_size, embed_dim, num_class, p=0.1):
+    def __init__(self, vocab_size, embed_dim, num_class, theta, p=0.1):
         super(TextClassificationModel, self).__init__()
         self.vocab_size = vocab_size
         self.label_size = num_class
@@ -77,6 +77,7 @@ class TextClassificationModel(nn.Module):
             nn.ReLU(),
             nn.Linear(2, 1)
         )
+        self.theta = theta
         self.init_weights()
 
     def init_weights(self):
@@ -115,7 +116,8 @@ class TextClassificationModel(nn.Module):
         return -1 * (torch.log(torch.tensor(1/3)) + torch.logsumexp(logit, dim=1, keepdim=True))
 
     def mlp(self, x):
-        return self.logistic_regression(x).squeeze()
+        # return self.logistic_regression(x).squeeze()
+        return (self.theta * x).squeeze()
         # out = self.input_fc(x.reshape((-1, 1)))
         # out = self.hidden_fc(out)
         # return self.output_fc(out).squeeze()
@@ -125,11 +127,13 @@ train_iter = AG_NEWS(split='train')
 num_class = len(set([label for (label, text) in train_iter])) - 1
 vocab_size = len(vocab)
 emsize = 64
+theta = torch.tensor(1.0, dtype=float, device=device, requires_grad=True)
 print(f'Vocab size is {vocab_size}')
 print(f'Embedding size is {emsize}')
 print(f'Num of class is {num_class}')
 print('-' * 59)
-model = TextClassificationModel(vocab_size, emsize, num_class).to(device)
+model = TextClassificationModel(
+    vocab_size, emsize, num_class, theta).to(device)
 # mlp = MLP().to(device)
 
 # consturct variables for GMM
@@ -158,24 +162,6 @@ def is_symmetric(x):
 def print_diff(x):
     # return (x == x.transpose(0, 1)).all()
     print((torch.abs(x - x.transpose(0, 1))).sum())
-
-
-# ignore this for now
-def update_bayesian(means, covs):
-    precs = torch.linalg.inv(covs)
-    diff_precs = precs.sum(0) - precs
-    precs_det = torch.linalg.det(precs)
-    total_precs_det = torch.linalg.det(precs.sum(0))
-    diff_precs_det = torch.linalg.det(diff_precs)
-    omegas = (total_precs_det - diff_precs_det + precs_det) / \
-        (precs.shape[0] * total_precs_det +
-         (precs_det - diff_precs_det).sum(0))
-    omegas = torch.unsqueeze(torch.unsqueeze(omegas, 1), 2)
-    weighted_precs = omegas * precs
-    final_cov = torch.linalg.inv(weighted_precs.sum(0))
-    final_mean = torch.squeeze(
-        final_cov @ (weighted_precs @ torch.unsqueeze(means, 2)).sum(0))
-    return final_mean, final_cov
 
 
 # online update gradient with a batch (not training batch size) of feature observations
@@ -271,9 +257,10 @@ def train(dataloader, class_count, class_mean, class_cov, feature_batch, beta, s
             uncertainty_loss += -1 * beta * \
                 F.logsigmoid(-1 * model.mlp(model.energy(feature[:1])))
             uncertainty_loss.backward()
-            # uncertainty_loss.backward(retain_graph=True)
             optimizer.step()
-            # print(model.input_fc.weight)
+            # L.register_hook(lambda grad: print(grad))
+            if model.theta != 1.0:
+                print(model.theta)
 
 
 def evaluate(dataloader, gamma):
@@ -316,8 +303,7 @@ def get_gamma(dataloader):
     model.eval()
     # the number of id data is about 4500
     # will have trailing zeros in the end
-    l, count = 4500, 0
-    print(f'l = {l}')
+    l, c = 120000, 0
     energies = torch.zeros(l)
 
     classidx_to_remove = 3
@@ -327,10 +313,14 @@ def get_gamma(dataloader):
             label, text = label[select], text[select]
 
             _, feature = model(text)
-            energies[count: count + label.shape[0]
+            # print(torch.sigmoid(model.mlp(model.energy(feature))).shape)
+            # print(label.shape[0], count + label.shape[0])
+            energies[c: c + label.shape[0]
                      ] = torch.sigmoid(model.mlp(model.energy(feature)))
-            count += label.shape[0]
-            # print(f'energy in evaluation: {torch.sigmoid(model.energy(feature)).mean()}')
+            c += label.shape[0]
+    print(f'c = {c}')
+    energies = energies[:c]
+    energies, _ = torch.sort(energies)
     print(energies)
     print(energies.mean())
     gamma = torch.quantile(energies, 0.95)
@@ -342,7 +332,6 @@ EPOCHS = 10  # epoch
 LR = 5  # learning rate
 BATCH_SIZE = 32  # batch size for training
 beta = 0.1  # weight of uncertainty loss
-gamma = 0.05  # the threshold for ood detection during inference
 criterion = torch.nn.CrossEntropyLoss()
 optimizer = torch.optim.SGD(model.parameters(), lr=LR)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.1)
@@ -369,8 +358,7 @@ for epoch in range(1, EPOCHS + 1):
     epoch_start_time = time.time()
     train(train_dataloader, class_count, class_mean,
           class_cov, feature_batch, beta, sample=sample)
-    # gamma = get_gamma(valid_dataloader)
-    gamma = 0.9
+    gamma = get_gamma(train_dataloader)
     print(f'computed gamma is {gamma}')
     accu_val, accu_id, accu_ood = evaluate(valid_dataloader, gamma)
     if total_accu is not None and total_accu > accu_val:
