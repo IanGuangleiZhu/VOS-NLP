@@ -1,3 +1,4 @@
+from operator import mod
 import time
 from torchtext.data.functional import to_map_style_dataset
 from torch.utils.data.dataset import random_split
@@ -65,13 +66,12 @@ class TextClassificationModel(nn.Module):
         self.vocab_size = vocab_size
         self.label_size = num_class
         self.embed_dim = embed_dim
-        # self.embedding = nn.EmbeddingBag(vocab_size, embed_dim, sparse=True)
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.conv = nn.Conv1d(in_channels=embed_dim,
                               out_channels=32, kernel_size=7, padding="same")
         self.dropout = nn.Dropout(p)
         self.fc = nn.Linear(32, num_class)
-        # for mlp
+        # for mlp, not used now
         self.logistic_regression = nn.Sequential(
             nn.Linear(1, 2),
             nn.ReLU(),
@@ -127,14 +127,13 @@ train_iter = AG_NEWS(split='train')
 num_class = len(set([label for (label, text) in train_iter])) - 1
 vocab_size = len(vocab)
 emsize = 64
-theta = torch.tensor(1.0, dtype=float, device=device, requires_grad=True)
+theta = torch.tensor(1e-1, dtype=float, device=device, requires_grad=True)
 print(f'Vocab size is {vocab_size}')
 print(f'Embedding size is {emsize}')
 print(f'Num of class is {num_class}')
 print('-' * 59)
 model = TextClassificationModel(
     vocab_size, emsize, num_class, theta).to(device)
-# mlp = MLP().to(device)
 
 # consturct variables for GMM
 # shape (num_class, feature_dim=out_channels)
@@ -188,16 +187,15 @@ def update_cov(class_mean, class_cov, class_count, feature_batch, label_batch):
         t = class_count[label]
         delta = (x - u).reshape((1, -1))
         class_cov[label] *= t / (1 + t)
-        # class_cov[label] += t / ((1 + t) ** 2) \
-        #  * (feature_batch[i] - class_mean[label]).reshape((-1, 1)) @ (feature_batch[i] - class_mean[label]).reshape((1, -1))
         class_cov[label] += t / ((1 + t) ** 2) * delta.T @ delta
 
 
-def train(dataloader, class_count, class_mean, class_cov, feature_batch, beta, sample=False):
+def train(dataloader, class_count, class_mean, class_cov, feature_batch, beta, sample=True):
     model.train()
     total_acc, total_count = 0, 0
     log_interval = 500
     start_time = time.time()
+    # loss = torch.tensor(0.0, dtype=float, device=device, requires_grad=True)
 
     classidx_to_remove = 3
     for idx, (label, text) in enumerate(dataloader):
@@ -207,14 +205,6 @@ def train(dataloader, class_count, class_mean, class_cov, feature_batch, beta, s
 
         predicted_label, feature = model(text)
         cls_loss = criterion(predicted_label, label)
-        cls_loss.backward(retain_graph=True)
-        # clip the gradient (really necessary?)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-        optimizer.step()
-        total_acc += (predicted_label.argmax(1) == label).sum().item()
-        total_count += label.size(0)
-
-        # code for calculate mean and covariance for GMM
         # select features that has correct label prediction
         feature_batch = feature[predicted_label.argmax(1) == label]
         label_batch = label[predicted_label.argmax(1) == label]
@@ -227,17 +217,10 @@ def train(dataloader, class_count, class_mean, class_cov, feature_batch, beta, s
             feature_batch = feature_batch[select]
         # print(
         #     f'epoch {epoch}, batch {idx}: pre-update symmetric {is_symmetric(class_cov[0].detach())}')
+        # code for calculate mean and covariance for GMM
         update_mean(class_mean, class_count, feature_batch, label_batch)
         update_cov(class_mean, class_cov, class_count,
                    feature_batch, label_batch)
-
-        if idx % log_interval == 0 and idx > 0:
-            elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches '
-                  '| accuracy {:8.3f}'.format(epoch, idx, len(dataloader),
-                                              total_acc/total_count))
-            total_acc, total_count = 0, 0
-            start_time = time.time()
 
         # only start sampling after some epoches
         if sample:
@@ -249,18 +232,33 @@ def train(dataloader, class_count, class_mean, class_cov, feature_batch, beta, s
             _, indices = torch.max(p, 0)
             outlier = r[indices]
             # compute the uncertainty loss
-            uncertainty_loss = -1 * beta * \
+            cls_loss += -1 * beta * \
                 F.logsigmoid(model.mlp(model.energy(outlier.unsqueeze(0))))
             # to-do: update the formula, Done
             # to-do: not sure how many iid features are needed
             # to-do: gradient update?
-            uncertainty_loss += -1 * beta * \
+            cls_loss += -1 * beta * \
                 F.logsigmoid(-1 * model.mlp(model.energy(feature[:1])))
-            uncertainty_loss.backward()
-            optimizer.step()
+            # uncertainty_loss.backward()
+            # optimizer.step()
             # L.register_hook(lambda grad: print(grad))
-            if model.theta != 1.0:
-                print(model.theta)
+            # if model.theta != 1.0:
+            #    print(model.theta)
+
+        cls_loss.backward()
+        # clip the gradient (really necessary?)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+        optimizer.step()
+        total_acc += (predicted_label.argmax(1) == label).sum().item()
+        total_count += label.size(0)
+
+        if idx % log_interval == 0 and idx > 0:
+            elapsed = time.time() - start_time
+            print('| epoch {:3d} | {:5d}/{:5d} batches '
+                  '| accuracy {:8.3f} | theta {:8.3f}'.format(epoch, idx, len(dataloader),
+                                                              total_acc/total_count, model.theta))
+            total_acc, total_count = 0, 0
+            start_time = time.time()
 
 
 def evaluate(dataloader, gamma):
@@ -275,27 +273,29 @@ def evaluate(dataloader, gamma):
     with torch.no_grad():
         for idx, (label, text) in enumerate(dataloader):
             select = label != classidx_to_remove
-            label, text = label[select], text[select]
-            select_ood = label == classidx_to_remove
-            label_ood, text_ood = label[select_ood], text[select_ood]
+            label_id, text_id = label[select], text[select]
+            # to-do: fix this
+            label_ood, text_ood = label[~select], text[~select]
 
-            predicted_label, feature = model(text)
+            predicted_label, feature_id = model(text_id)
             _, feature_ood = model(text_ood)
 
-            # print(f'energy in evaluation: {torch.sigmoid(model.energy(feature)).mean()}')
-            id = torch.sigmoid(model.mlp(model.energy(feature))) >= gamma
-            # ood = torch.sigmoid(model.mlp(model.energy(feature))) > gamma
+            id = torch.sigmoid(model.mlp(model.energy(feature_id))) >= gamma
             ood = torch.sigmoid(model.mlp(model.energy(feature_ood))) < gamma
 
-            loss = criterion(predicted_label[id], label[id])
+            # loss = criterion(predicted_label[id], label[id])
             total_acc += (predicted_label[id].argmax(1)
-                          == label[id]).sum().item()
-            total_count += label[id].size(0)
+                          == label_id[id]).sum().item()
+            total_count += label_id[id].shape[0]
             total_id_acc += id.sum()
-            total_id_count += label.shape[0]
-            total_ood_count += label_ood.size(0)
+            total_id_count += label_id.shape[0]
             total_ood_acc += ood.sum()
+            total_ood_count += label_ood.shape[0]
 
+    print(f'!! {total_ood_acc} {total_ood_count}')
+    # FPR 95
+    # the acc for classify id data, should be .95
+    # the acc for classify ood data
     return total_acc/total_count, total_id_acc/total_id_count, total_ood_acc/total_ood_count
 
 
@@ -305,6 +305,7 @@ def get_gamma(dataloader):
     # will have trailing zeros in the end
     l, c = 120000, 0
     energies = torch.zeros(l)
+    tmp = torch.zeros(l)
 
     classidx_to_remove = 3
     with torch.no_grad():
@@ -315,25 +316,34 @@ def get_gamma(dataloader):
             _, feature = model(text)
             # print(torch.sigmoid(model.mlp(model.energy(feature))).shape)
             # print(label.shape[0], count + label.shape[0])
+            tmp[c: c + label.shape[0]] = model.mlp(model.energy(feature))
             energies[c: c + label.shape[0]
                      ] = torch.sigmoid(model.mlp(model.energy(feature)))
             c += label.shape[0]
     print(f'c = {c}')
     energies = energies[:c]
-    energies, _ = torch.sort(energies)
+    tmp = tmp[:c]
+    # energies, _ = torch.sort(energies)
     print(energies)
-    print(energies.mean())
-    gamma = torch.quantile(energies, 0.95)
+    print(f'energy mean is {energies.mean().item()}')
+    print(tmp)
+    print(f'pre energy mean is {tmp.mean().item()}')
+    # should be 0.05 instead of 0.95!
+    gamma = torch.quantile(energies, 0.05)
     return gamma
 
 
 # Hyperparameters
 EPOCHS = 10  # epoch
-LR = 5  # learning rate
+# the second term is for the theta/mlp, the first term is for the rest
+LR = [5, 1e-7]  # learning rate
 BATCH_SIZE = 32  # batch size for training
 beta = 0.1  # weight of uncertainty loss
 criterion = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.SGD(model.parameters(), lr=LR)
+# optimizer = torch.optim.SGD(model.parameters(), lr=LR[0])
+optimizer = torch.optim.SGD([{'params': model.parameters(), 'lr': LR[0]},
+                             {'params': model.theta, 'lr': LR[1]}])
+
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.1)
 total_accu = None
 train_iter, test_iter = AG_NEWS()
@@ -351,10 +361,8 @@ valid_dataloader = DataLoader(split_valid_, batch_size=BATCH_SIZE,
 test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE,
                              shuffle=True, collate_fn=collate_batch)
 
-sample = False
+sample = True
 for epoch in range(1, EPOCHS + 1):
-    if epoch >= 1:
-        sample = True
     epoch_start_time = time.time()
     train(train_dataloader, class_count, class_mean,
           class_cov, feature_batch, beta, sample=sample)
